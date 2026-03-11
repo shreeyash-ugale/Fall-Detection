@@ -1,0 +1,28 @@
+services:
+
+  backend:
+    build: ./backend
+    container_name: fwds-backend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - ml-service
+    environment:
+      - ML_URL=http://ml-service:8000
+    restart: unless-stopped
+
+  ml-service:
+    build: ./ml-service
+    container_name: fwds-ml
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  log-service:
+    build: ./log-service
+    container_name: fwds-logs
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
