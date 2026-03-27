@@ -26,8 +26,8 @@ ml-service/.pytest_cache/
 ml-service/.mypy_cache/
 
 # Trained artefacts (large binary files – commit intentionally if needed)
-ml-service/model.pth
-ml-service/scaler.pkl
+#ml-service/model.pth
+#ml-service/scaler.pkl
 
 # Dataset (large; keep out of version control)
 ml-service/dataset/
