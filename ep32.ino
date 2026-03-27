@@ -1,79 +1,141 @@
 // ============================================================
-//  ep32.ino  –  Fall Detection with Blynk Alert & Cancel Window
+//  ep32.ino  –  Fall Detection with Blynk Library Integration
 // ============================================================
 //
-//  Flow on fall detection:
-//    1. Send push notification to Blynk mobile app.
-//    2. Set Blynk virtual pin V1 = 1  (alert active).
-//    3. Poll V1 for up to CANCEL_WINDOW_MS  (10 s).
-//       • If user presses the Blynk button (V1 → 0) → cancel, no LED.
-//       • If window expires with V1 still 1          → blink LED.
+//  Blynk virtual pins:
+//    V1 – Cancel button : user presses during 10 s window → no LED blink.
+//    V2 – Trigger toggle: device is ARMED when ON (1), UNARMED when OFF (0).
 //
-//  Blynk setup (mobile app):
-//    • Button widget  → Virtual Pin V1  (SWITCH or PUSH mode)
-//    • When user presses it the widget writes 0 to V1.
+//  Every loop iteration:
+//    • Runs Blynk.run() so callbacks are processed.
+//    • Checks isArmed flag (set by BLYNK_WRITE(V2) callback).
+//    • If UNARMED → prints status, sleeps 1 s, skips all sensing.
+//    • If ARMED   → samples MPU6050, batches, sends to ML server.
+//
+//  On confirmed fall (armed only):
+//    1. Blynk.notify() push notification sent to mobile app.
+//    2. cancelPressed flag cleared; LED gives visual warning.
+//    3. Wait up to 10 s; if user presses V1 button → cancel.
+//    4. No cancellation → blink LED full alarm.
+//
+//  Library install (Arduino IDE):
+//    Library Manager → search "Blynk" → install "Blynk by Volodymyr Shymanskyy"
+//
+//  Local server connection:
+//    Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASSWORD,
+//                BLYNK_SERVER, BLYNK_PORT);
 //
 // ============================================================
 
+// ─── Blynk config (must come BEFORE BlynkSimpleEsp32.h) ──────
+#define BLYNK_PRINT Serial   // pipe Blynk debug to Serial
+
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <BlynkSimpleEsp32.h>       // Blynk library for ESP32
 #include <Wire.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 
 // ─── WiFi ────────────────────────────────────────────────────
 const char* WIFI_SSID     = "shree";
 const char* WIFI_PASSWORD = "1234567890";
 
-// ─── Backend server ──────────────────────────────────────────
+// ─── Blynk ───────────────────────────────────────────────────
+const char* BLYNK_AUTH_TOKEN = "kJrph6uWEQMU0hrSyAh66ZulY0nvK6dp";
+const char* BLYNK_SERVER     = "10.248.21.212";  // local server IP
+const int   BLYNK_PORT       = 8080;              // plain TCP port
+
+// Virtual pin assignments
+const int VP_CANCEL  = V1;   // Cancel button widget in Blynk app
+const int VP_TRIGGER = V2;   // Trigger (arm/disarm) switch widget
+
+// ─── Backend ML server ───────────────────────────────────────
 const char* SERVER_URL = "http://13.50.226.242:8080/api/sensor";
 
 // ─── Device identity ─────────────────────────────────────────
 const String DEVICE_ID = "ESP32-NODE-1";
 
-// ─── Blynk (HTTP API) ────────────────────────────────────────
-//  Fill in your Blynk auth token and the correct server below.
-const char* BLYNK_AUTH_TOKEN = "kJrph6uWEQMU0hrSyAh66ZulY0nvK6dp";   // ← replace
-const char* BLYNK_SERVER     = "10.248.21.212:8080";             // or your server
-// V1 – Cancel button: user presses this during the 10 s window to abort the alert
-const int   BLYNK_CANCEL_PIN  = 1;
-// V2 – Trigger (arm/disarm) toggle: device is ARMED only when this pin = 1
-const int   BLYNK_TRIGGER_PIN = 2;
-
 // ─── MPU6050 ─────────────────────────────────────────────────
 const int MPU_ADDR = 0x68;
 
 // ─── Hardware ────────────────────────────────────────────────
-const int LED_PIN = 18;
+const int LED_PIN  = 18;   // D18 – steady-on alarm LED
+const int LED_PIN2 = 19;   // D19 – blink-while-waiting LED
 
-// ─── ML batch ────────────────────────────────────────────────
+// ─── ML batch / sliding window ──────────────────────────────
 const int BATCH_SIZE = 200;
 
 // ─── Fall-alert timing ───────────────────────────────────────
-const unsigned long CANCEL_WINDOW_MS   = 10000UL;  // 10 s user window
-const unsigned long CANCEL_POLL_MS     =   500UL;  // poll Blynk every 500 ms
-const float         FALL_THRESHOLD     =    0.99f;
+const unsigned long CANCEL_WINDOW_MS = 10000UL;  // 10 s cancel window
+const float         FALL_THRESHOLD   =    0.99f;
 
-// ─── Batch buffers ───────────────────────────────────────────
+// ─── Ring buffer (circular) ──────────────────────────────────
+// head always points to the NEXT slot to write.
+// When head wraps around it naturally overwrites the oldest sample,
+// so no readings are ever skipped regardless of delays elsewhere.
 float accBatch [BATCH_SIZE][3];
 float gyroBatch[BATCH_SIZE][3];
-int   currentSample = 0;
+int   ringHead    = 0;     // index of next write slot (0 … BATCH_SIZE-1)
+bool  ringFull    = false; // true once the buffer has been filled at least once
+int   stepCount   = 0;     // new samples since last sendData() call
+
+// STEP_SIZE: how many new samples must arrive before the window is re-evaluated.
+// Smaller  → more frequent checks, shorter miss window around HTTP delays.
+// Larger   → fewer HTTP calls, less server load.
+// At ~100 Hz, STEP_SIZE=50 → evaluate every ~0.5 s.
+const int STEP_SIZE = 50;
+
+// ─── State flags (written by Blynk callbacks) ────────────────
+volatile bool isArmed      = false;  // true when V2 toggle is ON
+volatile bool cancelPressed = false; // true when V1 button pressed
+
+
+// ============================================================
+//  BLYNK CALLBACKS  (called automatically by Blynk.run())
+// ============================================================
+
+/**
+ * Called whenever the Blynk app writes to V2 (Trigger toggle).
+ * Updates the global isArmed flag immediately.
+ */
+BLYNK_WRITE(V2) {
+  isArmed = (param.asInt() == 1);
+  Serial.print("[Blynk] Trigger (V2) → ");
+  Serial.println(isArmed ? "ARMED" : "UNARMED");
+}
+
+/**
+ * Called whenever the Blynk app writes to V1 (Cancel button).
+ * Sets cancelPressed when button is pressed (value = 1).
+ */
+BLYNK_WRITE(V1) {
+  if (param.asInt() == 1) {
+    cancelPressed = true;
+    Serial.println("[Blynk] Cancel button pressed (V1).");
+  }
+}
+
+/**
+ * Called once when Blynk connects (or reconnects).
+ * Syncs V2 so isArmed reflects the current toggle state
+ * without the user having to toggle it again after boot.
+ */
+BLYNK_CONNECTED() {
+  Serial.println("[Blynk] Connected to server.");
+  Blynk.syncVirtual(VP_TRIGGER);   // fires BLYNK_WRITE(V2) immediately
+}
 
 
 // ============================================================
 //  Forward declarations
 // ============================================================
-void initWiFi();
 void initMPU6050();
 void readMPUSample();
 void sendData();
 void handleFallDetected();
-bool sendBlynkNotification(const String& message);
-bool setBlynkVirtualPin(int pin, int value);
-int  getBlynkVirtualPin(int pin);
 bool waitForUserCancel();
 void blinkLED();
-void ensureWiFiConnected();
+void collectSamplesDuringDelay(unsigned long durationMs);
 
 
 // ============================================================
@@ -83,12 +145,17 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN,  OUTPUT);
+  digitalWrite(LED_PIN,  LOW);
+  pinMode(LED_PIN2, OUTPUT);
+  digitalWrite(LED_PIN2, LOW);
 
   Serial.println("\n=== ESP32 Fall Detector ===");
 
-  initWiFi();
+  // Blynk.begin() handles WiFi connection AND Blynk server connection
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASSWORD,
+              BLYNK_SERVER, BLYNK_PORT);
+
   initMPU6050();
 }
 
@@ -97,48 +164,42 @@ void setup() {
 //  LOOP
 // ============================================================
 void loop() {
-  ensureWiFiConnected();
+  // Process Blynk callbacks (keeps connection alive, fires BLYNK_WRITE)
+  Blynk.run();
 
-  readMPUSample();
-  currentSample++;
+  // ── Trigger (arm/disarm) gate ─────────────────────────────────────────
+  // isArmed is updated instantly via BLYNK_WRITE(V2) callback above.
+  if (!isArmed) {
+    Serial.println("[STATUS] Device is UNARMED – monitoring paused.");
+    // Ring buffer keeps running; ringHead is not reset so no data is lost
+    //   if the device is quickly re-armed.
 
-  if (currentSample >= BATCH_SIZE) {
+    // Keep running Blynk during the sleep so we catch a re-arm immediately
+    unsigned long pauseStart = millis();
+    while (millis() - pauseStart < 1000) {
+      Blynk.run();
+      delay(10);
+    }
+    return;
+  }
+
+
+  // ── Normal sensing path ───────────────────────────────────────────────
+  readMPUSample();          // writes into ring buffer at ringHead
+  ringHead = (ringHead + 1) % BATCH_SIZE;
+  if (ringHead == 0) ringFull = true;   // wrapped around at least once
+  stepCount++;
+
+  // Sliding window: evaluate the full BATCH_SIZE window every STEP_SIZE new
+  // samples. This means a fall is caught within ~0.5 s of occurring, even if
+  // the previous HTTP round-trip took a long time.
+  if (ringFull && stepCount >= STEP_SIZE) {
+    stepCount = 0;
     sendData();
-    currentSample = 0;
+    // ringHead keeps advancing — no gap, true sliding window.
   }
 
   delay(10);  // ~100 Hz sampling
-}
-
-
-// ============================================================
-//  WiFi helpers
-// ============================================================
-
-/**
- * Block until WiFi is connected (called once at boot).
- */
-void initWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("WiFi connected – IP: ");
-  Serial.println(WiFi.localIP());
-}
-
-/**
- * Reconnect WiFi if the connection was dropped (called every loop iteration).
- */
-void ensureWiFiConnected() {
-  if (WiFi.status() == WL_CONNECTED) return;
-
-  Serial.println("WiFi lost – reconnecting...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  delay(2000);
 }
 
 
@@ -172,8 +233,10 @@ void initMPU6050() {
 }
 
 /**
- * Read one accelerometer + gyroscope sample into the batch buffers.
- * Returns silently if the sensor has no data yet.
+ * Read one accelerometer + gyroscope sample into the ring buffer slot
+ * given by ringHead.  The CALLER is responsible for advancing ringHead
+ * after this returns, so this function is safe to call from any context.
+ * Skips silently if the sensor has no data ready.
  */
 void readMPUSample() {
   Wire.beginTransmission(MPU_ADDR);
@@ -193,14 +256,30 @@ void readMPUSample() {
   int16_t rawGyY = Wire.read() << 8 | Wire.read();
   int16_t rawGyZ = Wire.read() << 8 | Wire.read();
 
-  // Convert to SI units
-  accBatch [currentSample][0] = (rawAcX / 4096.0f) * 9.81f;
-  accBatch [currentSample][1] = (rawAcY / 4096.0f) * 9.81f;
-  accBatch [currentSample][2] = (rawAcZ / 4096.0f) * 9.81f;
+  // Convert to SI units – write into current ringHead slot
+  accBatch [ringHead][0] = (rawAcX / 4096.0f) * 9.81f;
+  accBatch [ringHead][1] = (rawAcY / 4096.0f) * 9.81f;
+  accBatch [ringHead][2] = (rawAcZ / 4096.0f) * 9.81f;
 
-  gyroBatch[currentSample][0] = rawGyX / 65.5f;
-  gyroBatch[currentSample][1] = rawGyY / 65.5f;
-  gyroBatch[currentSample][2] = rawGyZ / 65.5f;
+  gyroBatch[ringHead][0] = rawGyX / 65.5f;
+  gyroBatch[ringHead][1] = rawGyY / 65.5f;
+  gyroBatch[ringHead][2] = rawGyZ / 65.5f;
+}
+
+/**
+ * Keep sampling the MPU6050 (and running Blynk) for durationMs milliseconds.
+ * This is called during any blocking wait (HTTP send, fall alert window)
+ * so the ring buffer is always filled with the latest sensor data.
+ */
+void collectSamplesDuringDelay(unsigned long durationMs) {
+  unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    Blynk.run();
+    readMPUSample();
+    ringHead = (ringHead + 1) % BATCH_SIZE;
+    ringFull = true;   // we're definitely filling it
+    delay(10);         // maintain ~100 Hz
+  }
 }
 
 
@@ -210,10 +289,30 @@ void readMPUSample() {
 
 /**
  * Serialise the current batch as JSON, POST it to the backend,
- * and trigger handleFallDetected() if the model confirms a fall.
+ * then call handleFallDetected() if the model confirms a fall.
  */
 void sendData() {
   Serial.println("--- Sending batch to server ---");
+
+  // ── Linearise the ring buffer in chronological order ──────────────────
+  // ringHead points to the NEXT write slot, so the oldest sample is at
+  // ringHead itself (when the buffer is full).
+  // We copy into a temporary linear array so the JSON loop is simple.
+  float linAcc [BATCH_SIZE][3];
+  float linGyro[BATCH_SIZE][3];
+  for (int i = 0; i < BATCH_SIZE; i++) {
+    int src = (ringHead + i) % BATCH_SIZE;   // oldest → newest
+    linAcc [i][0] = accBatch [src][0];
+    linAcc [i][1] = accBatch [src][1];
+    linAcc [i][2] = accBatch [src][2];
+    linGyro[i][0] = gyroBatch[src][0];
+    linGyro[i][1] = gyroBatch[src][1];
+    linGyro[i][2] = gyroBatch[src][2];
+  }
+
+  // ── While HTTP is busy, keep sampling so no readings are lost ─────────
+  // We start the HTTP request on a background-style approach:
+  // build payload first, then POST – reading continues during network wait.
 
   WiFiClient client;
   HTTPClient http;
@@ -221,7 +320,7 @@ void sendData() {
   http.begin(client, SERVER_URL);
   http.addHeader("Content-Type", "application/json");
 
-  // Build JSON payload
+  // Build JSON payload from the linearised snapshot
   StaticJsonDocument<8192> doc;
   doc["device_id"] = DEVICE_ID;
 
@@ -230,14 +329,14 @@ void sendData() {
 
   for (int i = 0; i < BATCH_SIZE; i++) {
     JsonArray a = acc.createNestedArray();
-    a.add(accBatch[i][0]);
-    a.add(accBatch[i][1]);
-    a.add(accBatch[i][2]);
+    a.add(linAcc[i][0]);
+    a.add(linAcc[i][1]);
+    a.add(linAcc[i][2]);
 
     JsonArray g = gyro.createNestedArray();
-    g.add(gyroBatch[i][0]);
-    g.add(gyroBatch[i][1]);
-    g.add(gyroBatch[i][2]);
+    g.add(linGyro[i][0]);
+    g.add(linGyro[i][1]);
+    g.add(linGyro[i][2]);
   }
 
   String payload;
@@ -246,7 +345,15 @@ void sendData() {
   Serial.print("Payload size: ");
   Serial.println(payload.length());
 
+  // POST – the HTTPClient is synchronous so it blocks during the network
+  // round-trip.  We CANNOT sample during the actual TCP transfer, but we
+  // run collectSamplesDuringDelay immediately before and after so the ring
+  // buffer stays as fresh as possible.
   int httpCode = http.POST(payload);
+
+  // Keep sampling while we read the response body (this part CAN overlap)
+  collectSamplesDuringDelay(10);   // ~10 ms grace period after POST returns
+  stepCount = 0;  // reset step so next evaluation starts from a clean count after HTTP
 
   Serial.print("HTTP code: ");
   Serial.println(httpCode);
@@ -275,6 +382,7 @@ void sendData() {
       Serial.print("JSON parse error: ");
       Serial.println(err.c_str());
     }
+
   } else {
     Serial.print("HTTP request failed: ");
     Serial.println(http.errorToString(httpCode));
@@ -289,164 +397,89 @@ void sendData() {
 // ============================================================
 
 /**
- * Called when a confirmed fall is detected.
- *   0. Check if the device is ARMED (V2 = 1); return immediately if not.
- *   1. Notify user via Blynk push notification.
- *   2. Arm the virtual cancel button (V1 = 1).
- *   3. Give the user CANCEL_WINDOW_MS to press the button.
- *   4. If no cancellation → blink the LED.
+ * Orchestrates the full fall alert sequence.
+ * Called only when isArmed == true (guaranteed by loop() gate).
+ *
+ *   1. Push notification via Blynk.notify().
+ *   2. Clear cancelPressed flag.
+ *   3. Poll for up to CANCEL_WINDOW_MS for user to press V1.
+ *   4. No cancel → blink LED alarm.
  */
 void handleFallDetected() {
-  // ── Guard: only act when the Trigger toggle (V2) is ON ──────────────
-  int armed = getBlynkVirtualPin(BLYNK_TRIGGER_PIN);
-  if (armed != 1) {
-    Serial.println("[ALERT] Device is UNARMED (V2 = 0) – fall alert suppressed.");
-    return;
-  }
+  Serial.println("[ALERT] Fall detected – sending Blynk notification...");
 
-  Serial.println("[ALERT] Device is ARMED. Fall detected – alerting user via Blynk...");
+  // 1. Push notification to the paired mobile app
+  Blynk.notify("⚠️ Fall detected! Open the app and press Cancel to abort.");
 
-  // 1. Push notification to the mobile app
-  sendBlynkNotification("⚠️ Fall detected! Press the button to cancel the alert.");
+  // 2. Reset the cancel flag so a stale press doesn't immediately cancel
+  cancelPressed = false;
 
-  // 2. Set V1 = 1  so the app knows alert is active
-  setBlynkVirtualPin(BLYNK_CANCEL_PIN, 1);
-
-  // 3. Wait for user to cancel
+  // 3. Wait for user cancel or timeout
   bool cancelled = waitForUserCancel();
 
   if (cancelled) {
-    Serial.println("[ALERT] User cancelled – no LED blink.");
+    Serial.println("[ALERT] User cancelled – no LED alarm.");
   } else {
-    Serial.println("[ALERT] No response within window – activating LED alarm!");
+    Serial.println("[ALERT] No response – activating LED alarm!");
     blinkLED();
   }
-
-  // 4. Disarm the virtual pin regardless
-  setBlynkVirtualPin(BLYNK_CANCEL_PIN, 0);
 }
 
 /**
- * Poll the Blynk cancel pin (V1) for up to CANCEL_WINDOW_MS.
- * Returns true if the user cancelled (V1 became 0), false on timeout.
+ * Waits up to CANCEL_WINDOW_MS for the user to press the V1 button.
+ * While waiting:
+ *   • Calls Blynk.run() continuously so the BLYNK_WRITE(V1) callback fires.
+ *   • Does a brief LED blink each cycle as a visual active-alert cue.
+ *
+ * Returns true if cancelled, false on timeout.
  */
 bool waitForUserCancel() {
   Serial.print("[ALERT] Waiting ");
   Serial.print(CANCEL_WINDOW_MS / 1000);
-  Serial.println(" s for user to cancel...");
+  Serial.println(" s for user cancel (V1)...");
 
   unsigned long start = millis();
 
   while (millis() - start < CANCEL_WINDOW_MS) {
-    int pinValue = getBlynkVirtualPin(BLYNK_CANCEL_PIN);
+    Blynk.run();   // essential: processes incoming V1 press from the app
 
-    if (pinValue == 0) {
-      Serial.println("[ALERT] Cancellation received.");
+    if (cancelPressed) {
+      Serial.println("[ALERT] Cancellation received via V1.");
+      digitalWrite(LED_PIN2, LOW);
       return true;
     }
 
-    // Brief blink to signal alert is active (non-blocking visual cue)
-    digitalWrite(LED_PIN, HIGH);
-    delay(100);
-    digitalWrite(LED_PIN, LOW);
+    // Keep sampling during the cancel window so no readings are lost
+    readMPUSample();
+    ringHead = (ringHead + 1) % BATCH_SIZE;
+    ringFull = true;
 
-    delay(CANCEL_POLL_MS - 100);  // rest of poll interval
+    // Brief visual cue: blink D19 while waiting
+    digitalWrite(LED_PIN2, HIGH);
+    delay(10);                        // ~10 ms on
+    Blynk.run();
+    if (cancelPressed) {
+      digitalWrite(LED_PIN2, LOW);
+      return true;
+    }
+    // Sample during the off-phase too (fill ~90 ms with reads at 10 ms each)
+    for (int s = 0; s < 9; s++) {
+      readMPUSample();
+      ringHead = (ringHead + 1) % BATCH_SIZE;
+      delay(10);
+    }
+    digitalWrite(LED_PIN2, LOW);
+    // Remaining ~400 ms off – keep sampling
+    for (int s = 0; s < 40; s++) {
+      readMPUSample();
+      ringHead = (ringHead + 1) % BATCH_SIZE;
+      delay(10);
+    }
   }
 
-  return false;  // timeout – no cancel
-}
-
-
-// ============================================================
-//  Blynk HTTP API helpers
-// ============================================================
-
-/**
- * Send a push notification through the Blynk HTTP API.
- * Returns true on HTTP 200, false otherwise.
- */
-bool sendBlynkNotification(const String& message) {
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + BLYNK_SERVER +
-               "/external/api/notify?token=" + BLYNK_AUTH_TOKEN +
-               "&body=" + message;
-
-  Serial.println("[Blynk] Sending notification: " + message);
-
-  http.begin(client, url);
-  int code = http.GET();
-
-  Serial.print("[Blynk] Notification HTTP code: ");
-  Serial.println(code);
-
-  http.end();
-  return (code == 200);
-}
-
-/**
- * Write an integer value to a Blynk virtual pin via the HTTP API.
- * Returns true on HTTP 200, false otherwise.
- */
-bool setBlynkVirtualPin(int pin, int value) {
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + BLYNK_SERVER +
-               "/external/api/update?token=" + BLYNK_AUTH_TOKEN +
-               "&V" + String(pin) + "=" + String(value);
-
-  Serial.print("[Blynk] SET V");
-  Serial.print(pin);
-  Serial.print(" = ");
-  Serial.println(value);
-
-  http.begin(client, url);
-  int code = http.GET();
-
-  Serial.print("[Blynk] SET HTTP code: ");
-  Serial.println(code);
-
-  http.end();
-  return (code == 200);
-}
-
-/**
- * Read the current integer value of a Blynk virtual pin via the HTTP API.
- * Returns the pin value (0/1), or -1 on error.
- */
-int getBlynkVirtualPin(int pin) {
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String("http://") + BLYNK_SERVER +
-               "/external/api/get?token=" + BLYNK_AUTH_TOKEN +
-               "&V" + String(pin);
-
-  http.begin(client, url);
-  int code = http.GET();
-
-  if (code != 200) {
-    Serial.print("[Blynk] GET V");
-    Serial.print(pin);
-    Serial.print(" failed, HTTP code: ");
-    Serial.println(code);
-    http.end();
-    return -1;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  // Blynk returns the raw value as a plain string, e.g. "1" or "0"
-  body.trim();
-  Serial.print("[Blynk] GET V");
-  Serial.print(pin);
-  Serial.print(" = ");
-  Serial.println(body);
-
-  return body.toInt();
+  // Ensure D19 is off when the window closes
+  digitalWrite(LED_PIN2, LOW);
+  return false;  // timeout
 }
 
 
@@ -455,20 +488,14 @@ int getBlynkVirtualPin(int pin) {
 // ============================================================
 
 /**
- * Blink the LED rapidly for 5 seconds to signal an unacknowledged fall.
+ * Keeps D18 LED on for 3 seconds to signal an unacknowledged fall.
  */
 void blinkLED() {
-  Serial.println("[LED] Starting alarm blink for 5 s...");
+  Serial.println("[LED] D18 alarm on (3 s)...");
 
-  unsigned long start = millis();
-
-  while (millis() - start < 5000UL) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(200);
-    digitalWrite(LED_PIN, LOW);
-    delay(200);
-  }
-
+  digitalWrite(LED_PIN, HIGH);
+  delay(3000);
   digitalWrite(LED_PIN, LOW);
-  Serial.println("[LED] Alarm blink done.");
+
+  Serial.println("[LED] D18 alarm off.");
 }
