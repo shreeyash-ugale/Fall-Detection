@@ -13,10 +13,7 @@ SCALER_PATH = "scaler.pkl"
 DEVICE      = torch.device("cpu")
 THRESHOLD   = 0.5
 # Minimum RMS of dynamic (DC-removed) acceleration to run the model.
-# A real fall always has a significant impact spike. A still or near-still
-# sensor will always be below this, so we skip inference and return no-fall
-# rather than relying on the model which was never trained on static inputs.
-ACTIVITY_RMS_THRESHOLD = 0.5  # m/s²
+ACTIVITY_RMS_THRESHOLD = 5.0  # m/s²
 
 model = FallCNN(in_channels=CHANNELS, window_size=WINDOW_SIZE).to(DEVICE)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
@@ -61,17 +58,8 @@ def predict(data: SensorWindow):
     acc_dynamic = acc - acc.mean(axis=0, keepdims=True)
 
     # Pre-filter: skip inference when the sensor is essentially still.
-    # A fall always produces a significant impact spike; static noise never
-    # exceeds this RMS threshold, so there is no need to run the model.
     acc_rms = float(np.sqrt(np.mean(acc_dynamic ** 2)))
-    acc_mean = np.mean(acc, axis=0).round(4).tolist()
-    gyro_mean = np.mean(gyro, axis=0).round(4).tolist()
     if acc_rms < ACTIVITY_RMS_THRESHOLD:
-        print(
-            f"Prediction probability: 0.000000 (still, rms={acc_rms:.4f}) | "
-            f"acc_mean(x,y,z)={acc_mean} | "
-            f"gyro_mean(x,y,z)={gyro_mean}"
-        )
         return {"fall": False, "confidence": 0.0}
 
     features = np.concatenate([acc_dynamic, gyro], axis=1)
@@ -80,20 +68,44 @@ def predict(data: SensorWindow):
 
     with torch.no_grad():
         prob = model(tensor).item()
+        
+    # Heuristic Penalty for small movements to handle sensitivity.
+    # We penalize the NN confidence if the physical metrics don't resemble a big jerk/fall.
+    acc_magnitude = np.linalg.norm(acc, axis=1)
+    max_acc = float(np.max(acc_magnitude))
+    
+    gyro_magnitude = np.linalg.norm(gyro, axis=1)
+    max_gyro = float(np.max(gyro_magnitude))
+
+    penalty = 1.0
+    
+    # Penalize low impact acceleration (less than ~3.0g to 4.5g)
+    if max_acc < 30.0:
+        penalty *= 0.1
+    elif max_acc < 45.0:
+        penalty *= 0.1 + 0.9 * ((max_acc - 30.0) / 15.0)
+
+    # Penalize low rotation (less than 250 to 450 deg/s)
+    if max_gyro < 250.0:
+        penalty *= 0.2
+    elif max_gyro < 450.0:
+        penalty *= 0.2 + 0.8 * ((max_gyro - 250.0) / 200.0)
+
+    prob = prob * penalty
 
     acc_mean = np.mean(acc, axis=0).round(4).tolist()
-    gyro_mean = np.mean(gyro, axis=0).round(4).tolist()
+    raw_prob = prob / penalty if penalty > 0 else 0.0
     print(
-        f"Prediction probability: {prob:.6f} | "
-        f"acc_mean(x,y,z)={acc_mean} | "
-        f"gyro_mean(x,y,z)={gyro_mean}"
+        f"Raw Prob: {raw_prob:.4f} | "
+        f"Mod Prob: {prob:.4f} | "
+        f"max_acc: {max_acc:.1f} m/s^2 | max_gyro: {max_gyro:.1f} deg/s | "
+        f"acc_mean(x,y,z)={acc_mean}"
     )
 
     return {
         "fall":       prob >= THRESHOLD,
         "confidence": round(prob, 4),
     }
-
 
 @app.get("/health")
 def health():

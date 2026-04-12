@@ -88,8 +88,8 @@ volatile int stepCount = 0; // new samples since last sendData() call
 // STEP_SIZE: how many new samples must arrive before the window is
 // re-evaluated. Smaller  → more frequent checks, shorter miss window around
 // HTTP delays. Larger   → fewer HTTP calls, less server load. At ~100 Hz,
-// STEP_SIZE=50 → evaluate every ~0.5 s.
-const int STEP_SIZE = 50;
+// STEP_SIZE=100 → evaluate every ~1.0 s.
+const int STEP_SIZE = 100;
 
 // ─── State flags (written by Blynk callbacks) ────────────────
 volatile bool isArmed = false;       // true when V2 toggle is ON
@@ -221,16 +221,16 @@ void initMPU6050() {
   Wire.write(0x00);
   Wire.endTransmission(true);
 
-  // Accelerometer full-scale ±8 g
+  // Accelerometer full-scale ±16 g
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x1C);
-  Wire.write(0x10);
+  Wire.write(0x18);
   Wire.endTransmission(true);
 
-  // Gyroscope full-scale ±500°/s
+  // Gyroscope full-scale ±2000°/s
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x1B);
-  Wire.write(0x08);
+  Wire.write(0x18);
   Wire.endTransmission(true);
 
   Serial.println("MPU6050 ready");
@@ -263,13 +263,13 @@ void readMPUSample() {
   int16_t rawGyZ = Wire.read() << 8 | Wire.read();
 
   // Convert to SI units – write into current ringHead slot
-  accBatch[ringHead][0] = (rawAcX / 4096.0f) * 9.81f;
-  accBatch[ringHead][1] = (rawAcY / 4096.0f) * 9.81f;
-  accBatch[ringHead][2] = (rawAcZ / 4096.0f) * 9.81f;
+  accBatch[ringHead][0] = (rawAcX / 2048.0f) * 9.81f;
+  accBatch[ringHead][1] = (rawAcY / 2048.0f) * 9.81f;
+  accBatch[ringHead][2] = (rawAcZ / 2048.0f) * 9.81f;
 
-  gyroBatch[ringHead][0] = rawGyX / 65.5f;
-  gyroBatch[ringHead][1] = rawGyY / 65.5f;
-  gyroBatch[ringHead][2] = rawGyZ / 65.5f;
+  gyroBatch[ringHead][0] = rawGyX / 16.4f;
+  gyroBatch[ringHead][1] = rawGyY / 16.4f;
+  gyroBatch[ringHead][2] = rawGyZ / 16.4f;
 }
 
 // ============================================================
