@@ -1,0 +1,23 @@
+{
+  "name": "fall-detection-mail-service",
+  "version": "1.0.0",
+  "description": "Email notification service for fall detection alerts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "fall-detection",
+    "email",
+    "nodemailer"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.7",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
+  }
+}

@@ -26,3 +26,17 @@ services:
     volumes:
       - /run/user/1000/docker.sock:/var/run/docker.sock
     restart: unless-stopped
+
+  mail-service:
+    build: ./mail-service
+    container_name: fwds-mail
+    ports:
+      - "3001:3001"
+    environment:
+      - MAIL_SERVICE_PORT=3001
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - ALERT_EMAIL=shreeyash.santosh2023@vitstudent.ac.in
+    restart: unless-stopped

@@ -132,6 +132,7 @@ BLYNK_CONNECTED() {
 }
 
 // ============================================================
+// ============================================================
 //  Forward declarations
 // ============================================================
 void initMPU6050();
@@ -139,6 +140,7 @@ void readMPUSample();
 void sendData();
 void handleFallDetected();
 bool waitForUserCancel();
+void sendFallAlertEmail();
 void blinkLED();
 void sensorTaskCode(void *pvParameters);
 
@@ -489,13 +491,66 @@ bool waitForUserCancel() {
  * Keeps D18 LED on for 3 seconds to signal an unacknowledged fall.
  * LCD displays the alarm message for the full 3 seconds.
  */
+/**
+ * Sends a fall alert email to the mail service.
+ * Non-blocking: times out after 2 seconds to not delay the alarm.
+ */
+void sendFallAlertEmail() {
+  Serial.println("[EMAIL] 📧 Sending fall alert email...");
+
+  WiFiClient mailClient;
+  HTTPClient mailHttp;
+
+  String mailUrl = "http://10.248.21.212:3001/api/send-alert";
+  mailHttp.setTimeout(2000); // 2 second timeout
+
+  if (!mailHttp.begin(mailClient, mailUrl)) {
+    Serial.println("[EMAIL] ❌ Failed to begin HTTP connection");
+    return;
+  }
+
+  mailHttp.addHeader("Content-Type", "application/json");
+
+  // Prepare email payload
+  StaticJsonDocument<256> emailDoc;
+  emailDoc["device_id"] = DEVICE_ID;
+  emailDoc["timestamp"] = millis();
+
+  String emailPayload;
+  serializeJson(emailDoc, emailPayload);
+
+  Serial.print("[EMAIL] Sending payload: ");
+  Serial.println(emailPayload);
+
+  int httpCode = mailHttp.POST(emailPayload);
+
+  if (httpCode > 0) {
+    String response = mailHttp.getString();
+    Serial.print("[EMAIL] ✅ HTTP ");
+    Serial.print(httpCode);
+    Serial.print(" – Response: ");
+    Serial.println(response);
+  } else {
+    Serial.print("[EMAIL] ❌ HTTP request failed: ");
+    Serial.println(mailHttp.errorToString(httpCode));
+  }
+
+  mailHttp.end();
+}
+
 void blinkLED() {
   Serial.println("[LED] D18 alarm on (3 s)...");
 
   // Display LED and LCD for 3 seconds
   digitalWrite(LED_PIN, HIGH);
+  lcd.clear();
   lcd.print(0, 0, "ALARM!");
   lcd.print(0, 1, "Fall Alert!");
+
+  // Send fall alert email (non-blocking, ~2s timeout)
+  Serial.println("[LED] Initiating email notification...");
+  sendFallAlertEmail();
+
   delay(3000);
 
   // Ensure LED is off and LCD is cleared
