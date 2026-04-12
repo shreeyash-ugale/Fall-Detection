@@ -43,7 +43,7 @@ const char *WIFI_PASSWORD = "1234567890";
 
 // ─── Blynk ───────────────────────────────────────────────────
 const char *BLYNK_AUTH_TOKEN = "kJrph6uWEQMU0hrSyAh66ZulY0nvK6dp";
-const char *BLYNK_SERVER = "10.248.21.212"; // local server IP
+const char *BLYNK_SERVER = "10.255.207.212"; // local server IP
 const int BLYNK_PORT = 8080;                // plain TCP port
 
 // Virtual pin assignments
@@ -52,8 +52,10 @@ const int VP_TRIGGER = V2; // Trigger (arm/disarm) switch widget
 const int VP_LCD = V3;     // LCD display widget
 
 // ─── Backend ML server ───────────────────────────────────────
-//const char *SERVER_URL = "http://13.50.226.242:8080/api/sensor";
-const char *SERVER_URL = "http://10.248.21.212:8081/api/sensor";
+// Update these in one place when your backend or alert recipient changes.
+const char *ML_SERVER_URL = "http://10.255.207.212:8081/api/sensor";
+const char *MAIL_ALERT_URL = "http://10.255.207.212:3001/api/send-alert";
+const char *ALERT_EMAIL = "shreeyash.santosh2023@vitstudent.ac.in";
 
 // ─── Device identity ─────────────────────────────────────────
 const String DEVICE_ID = "ESP32-NODE-1";
@@ -326,7 +328,7 @@ void sendData() {
   WiFiClient client;
   HTTPClient http;
 
-  http.begin(client, SERVER_URL);
+  http.begin(client, ML_SERVER_URL);
   http.addHeader("Content-Type", "application/json");
 
   // Build JSON payload from the linearised snapshot
@@ -501,10 +503,9 @@ void sendFallAlertEmail() {
   WiFiClient mailClient;
   HTTPClient mailHttp;
 
-  String mailUrl = "http://10.248.21.212:3001/api/send-alert";
   mailHttp.setTimeout(2000); // 2 second timeout
 
-  if (!mailHttp.begin(mailClient, mailUrl)) {
+  if (!mailHttp.begin(mailClient, MAIL_ALERT_URL)) {
     Serial.println("[EMAIL] ❌ Failed to begin HTTP connection");
     return;
   }
@@ -515,6 +516,7 @@ void sendFallAlertEmail() {
   StaticJsonDocument<256> emailDoc;
   emailDoc["device_id"] = DEVICE_ID;
   emailDoc["timestamp"] = millis();
+  emailDoc["email"] = ALERT_EMAIL;
 
   String emailPayload;
   serializeJson(emailDoc, emailPayload);
